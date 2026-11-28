@@ -152,148 +152,255 @@ function getOrCreateBundle(bundleLookup, modelNum) {
     return bundleLookup.get(key);
 }
 
-async function handleFileUpload(event) {
-    event.preventDefault();
-    console.log('File upload triggered');
-    const file = event.type === 'drop' ? event.dataTransfer.files[0] : event.target.files[0];
+async function collectEntriesFromZip(file) {
+    const zip = await JSZip.loadAsync(file);
+    const entries = [];
+    for (const [filename, fileEntry] of Object.entries(zip.files)) {
+        if (fileEntry.dir) continue;
+        entries.push({
+            path: filename.replace(/\\/g, '/'),
+            readText: () => fileEntry.async('string')
+        });
+    }
+    return entries;
+}
 
-    if (!file || !file.name.endsWith('.zip')) {
-        alert('Please upload a ZIP file');
+function collectEntriesFromFileList(fileList) {
+    return Array.from(fileList)
+        .filter((f) => f && f.name)
+        .map((f) => ({
+            path: (f.webkitRelativePath || f.name).replace(/\\/g, '/'),
+            readText: () => f.text()
+        }));
+}
+
+async function processUploadedEntries(entries) {
+    // Clear previous data
+    modelData.clear();
+    modelBundles = [];
+    currentModelBundle = null;
+    resetIpsaeUI();
+
+    const dataFiles = [];
+    const summaryFiles = [];
+    let fallbackSummary = null;
+    const bundleLookup = new Map();
+
+    // Match subdirectories like "seed-1_sample-0/..."
+    const seedSamplePattern = /(?:^|\/)(seed-\d+_sample-\d+)(?:\/|$)/i;
+
+    for (const { path, readText } of entries) {
+        const normalizedPath = path.replace(/\\/g, '/');
+        const filename = baseFilename(normalizedPath);
+
+        // Skip MSA/template directories and template_hit CIFs if present
+        if (/(?:^|\/)(msas|templates)\//i.test(normalizedPath)) {
+            continue;
+        }
+        if (filename.toLowerCase().endsWith('.cif') && filename.toLowerCase().includes('template_hit')) {
+            console.log('Skipping template_hit CIF file:', normalizedPath);
+            continue;
+        }
+
+        const seedSampleMatch = normalizedPath.match(seedSamplePattern);
+
+        // 1. Local AF3 .sif layout: seed-X_sample-Y/ folders
+        if (seedSampleMatch) {
+            const sampleKey = seedSampleMatch[1]; // e.g., "seed-1_sample-0"
+            const bundle = getOrCreateBundle(bundleLookup, sampleKey);
+            bundle.displayName = `${sampleKey} (${filename})`;
+
+            if (filename.toLowerCase().endsWith('.cif')) {
+                bundle.cif = { name: filename, readText };
+                console.log('Found sample CIF file:', normalizedPath);
+            } else if (filename.endsWith('summary_confidences.json')) {
+                bundle.summary = { name: filename, readText };
+            } else if (filename.endsWith('_confidences.json')) {
+                dataFiles.push({ filename: normalizedPath, readText, modelNum: sampleKey });
+            }
+            continue;
+        }
+
+        // 2. Top-level local AF3 .sif files (e.g., HMD-MetY2_model.cif, HMD-MetY2_confidences.json)
+        if (filename.toLowerCase().endsWith('.cif') && !/_model_\d+\.cif$/i.test(filename)) {
+            const bundle = getOrCreateBundle(bundleLookup, 'top-level');
+            bundle.cif = { name: filename, readText };
+            bundle.displayName = `${filename} (top-level)`;
+            console.log('Found top-level CIF file:', normalizedPath);
+        } else if (filename.endsWith('_confidences.json') && !filename.includes('summary_confidences')) {
+            dataFiles.push({ filename: normalizedPath, readText, modelNum: 'top-level' });
+        } else if (filename.endsWith('summary_confidences.json') && !/_summary_confidences_\d+\.json$/i.test(filename)) {
+            summaryFiles.push({ filename: normalizedPath, readText, modelNum: 'top-level' });
+        }
+
+        // 3. Legacy web-server / numbered layout
+        if (filename.toLowerCase().endsWith('.cif') && /_model_\d+/i.test(filename)) {
+            const modelNum = extractModelNumber(filename, [/_model_(\d+)/i]);
+            const bundle = getOrCreateBundle(bundleLookup, modelNum);
+            bundle.cif = { name: filename, readText };
+            bundle.displayName = filename;
+            console.log('Found CIF file:', normalizedPath);
+        } else if (filename.includes('_full_data_')) {
+            console.log('Found data file:', normalizedPath);
+            const modelNum = extractModelNumber(filename, [/_full_data_(\d+)/i]);
+            dataFiles.push({ filename: normalizedPath, readText, modelNum });
+        } else if (filename.includes('summary_confidences')) {
+            const modelNum = extractModelNumber(filename, [/_summary_confidences_(\d+)/i, /summary_confidences_(\d+)/i]);
+            if (modelNum !== null) {
+                summaryFiles.push({ filename: normalizedPath, readText, modelNum });
+            } else {
+                fallbackSummary = { filename: normalizedPath, readText };
+            }
+        }
+    }
+
+    if (dataFiles.length === 0) {
+        throw new Error('No confidence/data files found in upload');
+    }
+
+    // Parse confidence/data files and populate modelData + bundle.fullData
+    for (const fileInfo of dataFiles) {
+        try {
+            console.log('Processing data file:', fileInfo.filename);
+            const content = await fileInfo.readText();
+            const data = JSON.parse(content);
+            console.log(
+                `For ${fileInfo.filename}: chainIds=${data.atom_chain_ids?.length}, plddts=${data.atom_plddts?.length}, pae=${data.pae?.length}`
+            );
+
+            if (!data.atom_chain_ids || !data.atom_plddts || !data.pae) {
+                console.error('Missing expected keys (atom_chain_ids, atom_plddts, pae) in file:', fileInfo.filename);
+                continue;
+            }
+
+            const modelNum = fileInfo.modelNum;
+            if (!modelNum) {
+                console.error('Could not determine model key for file:', fileInfo.filename);
+                continue;
+            }
+
+            modelData.set(modelNum, {
+                chainIds: data.atom_chain_ids,
+                plddts: data.atom_plddts,
+                pae: data.pae
+            });
+
+            const bundle = getOrCreateBundle(bundleLookup, modelNum);
+            if (!bundle.displayName) {
+                bundle.displayName = `${modelNum} (${baseFilename(fileInfo.filename)})`;
+            }
+            bundle.fullData = { name: baseFilename(fileInfo.filename), readText: fileInfo.readText, text: content };
+            console.log(`Successfully loaded model ${modelNum}`);
+        } catch (err) {
+            console.error('Error processing file:', fileInfo.filename, err);
+        }
+    }
+
+    // Attach summary files to bundles
+    summaryFiles.forEach(({ filename, readText, modelNum }) => {
+        const bundle = bundleLookup.get(modelNum);
+        if (bundle) {
+            bundle.summary = { name: baseFilename(filename), readText };
+        }
+    });
+
+    if (fallbackSummary) {
+        for (const bundle of bundleLookup.values()) {
+            if (!bundle.summary) {
+                bundle.summary = { name: baseFilename(fallbackSummary.filename), readText: fallbackSummary.readText };
+            }
+        }
+    }
+
+    // Keep bundles that have a CIF and confidence/data JSON; sort numeric IDs numerically and seed-sample keys naturally
+    modelBundles = Array.from(bundleLookup.values())
+        .filter((bundle) => bundle.cif && bundle.fullData)
+        .sort((a, b) => {
+            const numA = Number(a.modelNum);
+            const numB = Number(b.modelNum);
+            if (!Number.isNaN(numA) && !Number.isNaN(numB)) {
+                return numA - numB;
+            }
+            return String(a.modelNum).localeCompare(String(b.modelNum), undefined, { numeric: true });
+        });
+
+    populateModelSelector();
+
+    // Load the first model's CIF structure
+    if (modelBundles.length > 0) {
+        console.log("Loading structure from first model's CIF data...");
+        try {
+            const firstBundle = modelBundles[0];
+            const cifContent = await getBundleText(firstBundle, 'cif');
+            await window.Viewer.loadStructureFromData(cifContent, 'mmcif');
+            console.log(`Structure loaded from data for model file: ${firstBundle.cif.name}`);
+            document.getElementById('modelSelector').value = '0';
+            currentModelBundle = firstBundle;
+            updateIpsaeControls(firstBundle);
+            scheduleAutomaticIpsaeRun();
+        } catch (e) {
+            console.error('Error loading structure from data:', e);
+        }
+    }
+
+    // Draw plots if we have data
+    if (modelData.size > 0) {
+        console.log('Drawing plots with', modelData.size, 'models');
+        window.Plots.drawPAEMatrices(modelData);
+        window.Plots.drawPLDDTPlot(modelData);
+    } else {
+        throw new Error('No valid model data could be loaded');
+    }
+}
+
+async function handleFileUpload(event) {
+    event?.preventDefault?.();
+    const files = Array.from(event?.dataTransfer?.files || event?.target?.files || []);
+    if (!files.length) return;
+
+    try {
+        document.body.style.cursor = "wait";
+        if (files.length === 1 && files[0].name.toLowerCase().endsWith(".zip")) {
+            const entries = await collectEntriesFromZip(files[0]);
+            await processUploadedEntries(entries);
+            return;
+        }
+
+        const entries = event?.dataTransfer
+            ? await collectEntriesFromDataTransfer(event.dataTransfer)
+            : collectEntriesFromFileList(files);
+
+        if (!entries.length) {
+            throw new Error("No files found in dropped item");
+        }
+
+        await processUploadedEntries(entries);
+    } catch (error) {
+        console.error(error);
+        alert(error.message);
+    } finally {
+        document.body.style.cursor = "default";
+    }
+}
+
+async function handleFolderUpload(event) {
+    event.preventDefault();
+    console.log('Folder upload triggered');
+    const files = event.type === 'drop' ? event.dataTransfer?.files : event.target?.files;
+
+    if (!files || files.length === 0) {
+        alert('Please select a folder');
         return;
     }
 
     try {
         document.body.style.cursor = 'wait';
-        console.log('Loading zip file:', file.name);
-        const zip = await JSZip.loadAsync(file);
-
-        // Clear previous data
-        modelData.clear();
-        modelBundles = [];
-        currentModelBundle = null;
-        resetIpsaeUI();
-        const dataFiles = [];
-        const summaryFiles = [];
-        let fallbackSummary = null;
-        const bundleLookup = new Map();
-
-        // Sort and process files
-        for (const [filename, fileEntry] of Object.entries(zip.files)) {
-            if (!fileEntry.dir) {  // Skip directories
-                if (filename.endsWith('.cif')) {
-                    if (filename.toLowerCase().includes('template_hit')) {
-                        console.log('Skipping template_hit CIF file:', filename);
-                        continue;
-                    }
-                    const modelNum = extractModelNumber(filename, [/_model_(\d+)/i]);
-                    const bundle = getOrCreateBundle(bundleLookup, modelNum);
-                    bundle.cif = { name: baseFilename(filename), entry: fileEntry };
-                    bundle.displayName = baseFilename(filename);
-                    console.log('Found CIF file:', filename);
-                } else if (filename.includes('_full_data_')) {
-                    console.log('Found data file:', filename);
-                    const modelNum = extractModelNumber(filename, [/_full_data_(\d+)/i]);
-                    dataFiles.push({ filename, fileEntry, modelNum });
-                } else if (filename.includes('summary_confidences')) {
-                    const modelNum = extractModelNumber(filename, [/_summary_confidences_(\d+)/i, /summary_confidences_(\d+)/i]);
-                    if (modelNum !== null) {
-                        summaryFiles.push({ filename, fileEntry, modelNum });
-                    } else {
-                        fallbackSummary = { filename, fileEntry };
-                    }
-                }
-            }
-        }
-
-        if (dataFiles.length === 0) {
-            throw new Error('No data files found in ZIP');
-        }
-
-        // Process data files and build modelData
-        for (const fileInfo of dataFiles) {
-            try {
-                console.log('Processing data file:', fileInfo.filename);
-                const content = await fileInfo.fileEntry.async('string');
-                const data = JSON.parse(content);
-                console.log(`For ${fileInfo.filename}: chainIds=${data.atom_chain_ids?.length}, plddts=${data.atom_plddts?.length}, pae=${data.pae?.length}`);
-
-                // Validate data structure
-                if (!data.atom_chain_ids || !data.atom_plddts || !data.pae) {
-                    console.error('Invalid data structure in file:', fileInfo.filename);
-                    continue;
-                }
-
-                const modelNum = fileInfo.modelNum ?? fileInfo.filename.match(/_full_data_(\d+)\.json$/)?.[1];
-                if (!modelNum) {
-                    console.error('Could not extract model number from filename:', fileInfo.filename);
-                    continue;
-                }
-
-                modelData.set(modelNum, {
-                    chainIds: data.atom_chain_ids,
-                    plddts: data.atom_plddts,
-                    pae: data.pae
-                });
-                const bundle = getOrCreateBundle(bundleLookup, modelNum);
-                bundle.fullData = { name: baseFilename(fileInfo.filename), entry: fileInfo.fileEntry, text: content };
-                console.log(`Successfully loaded model ${modelNum}`);
-            } catch (err) {
-                console.error('Error processing file:', fileInfo.filename, err);
-            }
-        }
-
-        // Attach summary files to bundles
-        summaryFiles.forEach(({ filename, fileEntry, modelNum }) => {
-            const bundle = bundleLookup.get(modelNum);
-            if (bundle) {
-                bundle.summary = { name: baseFilename(filename), entry: fileEntry };
-            }
-        });
-
-        if (fallbackSummary) {
-            for (const bundle of bundleLookup.values()) {
-                if (!bundle.summary) {
-                    bundle.summary = { name: baseFilename(fallbackSummary.filename), entry: fallbackSummary.fileEntry };
-                }
-            }
-        }
-
-        modelBundles = Array.from(bundleLookup.values())
-            .filter((bundle) => bundle.cif && bundle.fullData)
-            .sort((a, b) => Number(a.modelNum) - Number(b.modelNum));
-
-        // Populate the model selector dropdown
-        populateModelSelector();
-
-        // Load the first model's CIF data
-        if (modelBundles.length > 0) {
-            console.log('Loading structure from first model\'s CIF data...');
-            try {
-                const firstBundle = modelBundles[0];
-                const cifContent = await getBundleText(firstBundle, 'cif');
-                await window.Viewer.loadStructureFromData(cifContent, 'mmcif');
-                console.log(`Structure loaded from data for model file: ${firstBundle.cif.name}`);
-                document.getElementById('modelSelector').value = '0';
-                currentModelBundle = firstBundle;
-                updateIpsaeControls(firstBundle);
-                scheduleAutomaticIpsaeRun();
-            } catch (e) {
-                console.error('Error loading structure from data:', e);
-            }
-        }
-
-        // Draw plots if we have data
-        if (modelData.size > 0) {
-            console.log('Drawing plots with', modelData.size, 'models');
-            window.Plots.drawPAEMatrices(modelData);
-            window.Plots.drawPLDDTPlot(modelData);
-        } else {
-            throw new Error('No valid model data could be loaded');
-        }
-
+        console.log('Loading folder with', files.length, 'files');
+        const entries = collectEntriesFromFileList(files);
+        await processUploadedEntries(entries);
     } catch (error) {
-        console.error('Error processing file:', error);
-        alert('Error processing file: ' + error.message);
+        console.error('Error processing folder:', error);
+        alert('Error processing folder: ' + error.message);
     } finally {
         document.body.style.cursor = 'default';
     }
@@ -301,11 +408,14 @@ async function handleFileUpload(event) {
 
 function populateModelSelector() {
     const modelSelector = document.getElementById('modelSelector');
+    if (!modelSelector) return;
     modelSelector.innerHTML = '<option value="">Select a model</option>';
     modelBundles.forEach((bundle, index) => {
         const option = document.createElement('option');
         option.value = index;
-        option.textContent = bundle.displayName || bundle.cif?.name || `Model ${bundle.modelNum}`;
+        const label = String(bundle.modelNum ?? bundle.displayName ?? `Model ${index}`);
+        option.textContent = label;
+        option.title = bundle.displayName || label;
         modelSelector.appendChild(option);
     });
 }
@@ -356,16 +466,20 @@ async function handleLoadAllModels() {
 }
 
 async function getBundleText(bundle, key) {
-    if (!bundle || !bundle[key]) {
+    const target = bundle?.[key];
+    if (!target) {
         throw new Error(`Missing ${key} for selected model.`);
     }
-    const target = bundle[key];
-    if (target.text) return target.text;
-    if (!target.entry) {
-        throw new Error(`File entry for ${key} is not available.`);
+    if (typeof target.text === 'string') return target.text;
+    if (typeof target.readText === 'function') {
+        target.text = await target.readText();
+        return target.text;
     }
-    target.text = await target.entry.async('string');
-    return target.text;
+    if (target.entry) {
+        target.text = await target.entry.async('string');
+        return target.text;
+    }
+    throw new Error(`File source for ${key} is not available.`);
 }
 
 function formatNumber(value, decimals = 4) {
@@ -841,45 +955,136 @@ function initIpsaeUI() {
 //     }
 // }
 
+async function walkDirectoryEntry(dirEntry, prefix = "") {
+    const entries = [];
+    const reader = dirEntry.createReader();
+
+    const readAllEntries = () =>
+        new Promise((resolve, reject) => {
+            const batch = [];
+            const readBatch = () => {
+                reader.readEntries((results) => {
+                    if (!results.length) {
+                        resolve(batch);
+                    } else {
+                        batch.push(...results);
+                        readBatch();
+                    }
+                }, reject);
+            };
+            readBatch();
+        });
+
+    const children = await readAllEntries();
+    for (const child of children) {
+        const childPath = prefix ? `${prefix}/${child.name}` : child.name;
+        if (child.isFile) {
+            entries.push({
+                path: childPath.replace(/\\/g, "/"),
+                readText: () =>
+                    new Promise((resolve, reject) => {
+                        child.file(
+                            (file) => file.text().then(resolve, reject),
+                            reject
+                        );
+                    })
+            });
+        } else if (child.isDirectory) {
+            const nested = await walkDirectoryEntry(child, childPath);
+            entries.push(...nested);
+        }
+    }
+    return entries;
+}
+
+async function collectEntriesFromDataTransfer(dataTransfer) {
+    const items = Array.from(dataTransfer?.items || []);
+    const hasEntryApi = items.some((item) => typeof item.webkitGetAsEntry === "function");
+
+    if (hasEntryApi) {
+        const allEntries = [];
+        for (const item of items) {
+            if (item.kind !== "file") continue;
+            let entry = null;
+            try {
+                entry = item.webkitGetAsEntry();
+            } catch {
+                continue;
+            }
+            if (!entry) continue;
+
+            if (entry.isFile) {
+                allEntries.push({
+                    path: entry.name.replace(/\\/g, "/"),
+                    readText: () =>
+                        new Promise((resolve, reject) => {
+                            entry.file(
+                                (file) => file.text().then(resolve, reject),
+                                reject
+                            );
+                        })
+                });
+            } else if (entry.isDirectory) {
+                const dirEntries = await walkDirectoryEntry(entry, entry.name);
+                allEntries.push(...dirEntries);
+            }
+        }
+        if (allEntries.length > 0) return allEntries;
+    }
+
+    return collectEntriesFromFileList(dataTransfer?.files || []);
+}
+
 function setupDragAndDrop() {
-    const dropZone = document.querySelector('.upload-section');
+    const dropZone = document.getElementById("dropZone") || document.querySelector(".upload-section");
+    const zipInput = document.getElementById("zipUpload");
 
-    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-        dropZone.addEventListener(eventName, preventDefaults, false);
+    if (!dropZone) return;
+
+    dropZone.addEventListener("click", (event) => {
+        if (event.target === zipInput) return;
+        if (zipInput) {
+            zipInput.value = "";
+            zipInput.click();
+        }
     });
 
-    function preventDefaults(e) {
-        e.preventDefault();
-        e.stopPropagation();
-    }
-
-    ['dragenter', 'dragover'].forEach(eventName => {
-        dropZone.addEventListener(eventName, highlight, false);
+    ["dragenter", "dragover"].forEach((eventName) => {
+        dropZone.addEventListener(eventName, (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            dropZone.classList.add("drag-over");
+        });
     });
 
-    ['dragleave', 'drop'].forEach(eventName => {
-        dropZone.addEventListener(eventName, unhighlight, false);
+    ["dragleave", "dragend"].forEach((eventName) => {
+        dropZone.addEventListener(eventName, (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            dropZone.classList.remove("drag-over");
+        });
     });
 
-    function highlight(e) {
-        dropZone.classList.add('highlight');
-    }
-
-    function unhighlight(e) {
-        dropZone.classList.remove('highlight');
-    }
-
-    dropZone.addEventListener('drop', handleFileUpload, false);
+    dropZone.addEventListener("drop", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        dropZone.classList.remove("drag-over");
+        await handleFileUpload(event);
+    });
 }
 
 // Simplified initialization
 document.addEventListener('DOMContentLoaded', async () => {
     try {
         initIpsaeUI();
-        const uploadInput = document.getElementById('zipUpload');
-        uploadInput.addEventListener('change', handleFileUpload);
+
+        const zipInput = document.getElementById('zipUpload');
+        if (zipInput) {
+            zipInput.addEventListener('change', handleFileUpload);
+        }
         setupDragAndDrop();
-        console.log('File upload initialized');
+        console.log('File and folder upload initialized');
 
         // Initialize Molstar viewer
         console.log('Initializing Molstar after DOMContentLoaded...');

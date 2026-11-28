@@ -5,7 +5,7 @@ if (typeof Plotly.makeSubplots !== 'function') {
         const hSpacing = options.horizontal_spacing || 0;
         const vSpacing = options.vertical_spacing || 0;
         let layout = {};
-        
+
         for (let r = 0; r < rows; r++) {
             for (let c = 0; c < cols; c++) {
                 const i = r * cols + c + 1;
@@ -19,11 +19,11 @@ if (typeof Plotly.makeSubplots !== 'function') {
                 layout[yKey] = { domain: [y0, y1], anchor: xKey };
             }
         }
-        
+
         if (options.subplot_titles) {
             layout.annotations = options.subplot_titles.map((title, index) => ({
                 text: title,
-                x: (index % cols) / cols + 0.5/cols,
+                x: (index % cols) / cols + 0.5 / cols,
                 y: 1 - Math.floor(index / cols) / rows,
                 xref: 'paper',
                 yref: 'paper',
@@ -31,40 +31,191 @@ if (typeof Plotly.makeSubplots !== 'function') {
                 font: { size: 14 }
             }));
         }
-        
+
         return { data: [], layout: layout };
     };
 }
 
-function drawPAEMatrices(modelData) {
-    console.log('Drawing PAE matrices with data:', modelData);
-    const paeDiv = document.getElementById('paeMatrices');
-    const modelEntries = Array.from(modelData.entries());
-    const numPlots = modelEntries.length;
-    if (numPlots === 0) return;
+const PAE_PAGE_SIZE = 5;
+let paeState = {
+    entries: [],
+    page: 0
+};
 
-    const cols = 3;
-    const rows = Math.ceil(numPlots / cols);
-    const subplotTitles = modelEntries.map(([modelNum]) => `Model ${modelNum}`);
-    
-    // Create the subplot figure using our polyfill
-    const fig = Plotly.makeSubplots({
-        rows, cols,
-        subplot_titles: subplotTitles,
-        horizontal_spacing: 0.05,
-        vertical_spacing: 0.1
+function comparePaeKeys(aKey, bKey) {
+    const aIsTop = String(aKey).toLowerCase() === 'top-level';
+    const bIsTop = String(bKey).toLowerCase() === 'top-level';
+    if (aIsTop && !bIsTop) return 1;
+    if (!aIsTop && bIsTop) return -1;
+    if (aIsTop && bIsTop) return 0;
+
+    const re = /^seed-(\d+)_sample-(\d+)$/i;
+    const ma = String(aKey).match(re);
+    const mb = String(bKey).match(re);
+    if (ma && mb) {
+        const seedDiff = Number(ma[1]) - Number(mb[1]);
+        if (seedDiff !== 0) return seedDiff;
+        return Number(ma[2]) - Number(mb[2]);
+    }
+
+    const numA = Number(aKey);
+    const numB = Number(bKey);
+    if (!Number.isNaN(numA) && !Number.isNaN(numB)) {
+        return numA - numB;
+    }
+
+    return String(aKey).localeCompare(String(bKey), undefined, { numeric: true });
+}
+
+function ensureCleanPAEStyles() {
+    if (document.getElementById('pae-clean-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'pae-clean-styles';
+    style.textContent = `
+        #paeMatrices,
+        #paeMatrices > div,
+        #paeMatrices .pae-grid > div,
+        #paeMatrices .js-plotly-plot,
+        #paeMatrices .plot-container,
+        #paeMatrices .svg-container {
+            border: none !important;
+            box-shadow: none !important;
+            background: transparent !important;
+            border-radius: 0 !important;
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+function drawPanelColorbar(barEl, paeMatrix, panelHeight) {
+    const barHeight = Math.max(240, Math.round(panelHeight * 0.92));
+    const trace = {
+        z: paeMatrix,
+        type: 'heatmap',
+        opacity: 0,
+        colorscale: [
+            [0, 'rgb(0,0,255)'],
+            [0.5, 'rgb(255,255,255)'],
+            [1, 'rgb(255,0,0)']
+        ],
+        zauto: false,
+        zmin: 0,
+        zmax: 30,
+        showscale: true,
+        colorbar: {
+            x: 0.05,
+            xanchor: 'left',
+            y: 0.5,
+            yanchor: 'middle',
+            len: barHeight,
+            lenmode: 'pixels',
+            thickness: 24,
+            outlinewidth: 1,
+            outlinecolor: 'rgba(0,0,0,0.45)',
+            borderwidth: 0,
+            tickmode: 'linear',
+            tick0: 0,
+            dtick: 5,
+            tickfont: { size: 11 }
+        },
+        hoverinfo: 'none'
+    };
+
+    const layout = {
+        width: 100,
+        height: panelHeight,
+        margin: { t: 8, b: 8, l: 0, r: 45 },
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(0,0,0,0)',
+        xaxis: { visible: false, showgrid: false, zeroline: false },
+        yaxis: { visible: false, showgrid: false, zeroline: false }
+    };
+
+    Plotly.newPlot(barEl, [trace], layout, { responsive: false, displayModeBar: false });
+}
+
+function renderPAEPage() {
+    const paeDiv = document.getElementById('paeMatrices');
+    if (!paeDiv) return;
+
+    ensureCleanPAEStyles();
+
+    const { entries, page } = paeState;
+    const total = entries.length;
+    if (total === 0) {
+        paeDiv.innerHTML = '';
+        return;
+    }
+
+    const totalPages = Math.max(1, Math.ceil(total / PAE_PAGE_SIZE));
+    const safePage = Math.max(0, Math.min(page, totalPages - 1));
+    paeState.page = safePage;
+
+    const start = safePage * PAE_PAGE_SIZE;
+    const slice = entries.slice(start, start + PAE_PAGE_SIZE);
+
+    paeDiv.innerHTML = '';
+
+    const navBar = document.createElement('div');
+    navBar.style.cssText = 'display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;';
+
+    const prevBtn = document.createElement('button');
+    prevBtn.type = 'button';
+    prevBtn.textContent = 'Prev 5';
+    prevBtn.disabled = safePage === 0;
+    prevBtn.addEventListener('click', () => {
+        paeState.page = Math.max(0, paeState.page - 1);
+        renderPAEPage();
     });
-    
-    // Find chain boundaries for the first model data (assuming similar structure for all models)
-    const firstModelData = modelEntries[0][1];
-    const chainBoundaries = findChainBoundariesForPAE(firstModelData);
-    console.log('Chain boundaries for PAE:', chainBoundaries);
-    
-    // Get the matrix size from the first model
-    const matrixSize = firstModelData.pae.length;
-    
-    // Loop over each model, assign axis names, and push the trace into fig.data
-    modelEntries.forEach(([modelNum, data], i) => {
+
+    const nextBtn = document.createElement('button');
+    nextBtn.type = 'button';
+    nextBtn.textContent = 'Next 5';
+    nextBtn.disabled = safePage >= totalPages - 1;
+    nextBtn.addEventListener('click', () => {
+        paeState.page = Math.min(totalPages - 1, paeState.page + 1);
+        renderPAEPage();
+    });
+
+    const statusSpan = document.createElement('span');
+    statusSpan.textContent = `Showing ${start + 1}–${Math.min(start + PAE_PAGE_SIZE, total)} of ${total} (Page ${safePage + 1}/${totalPages})`;
+
+    navBar.append(prevBtn, nextBtn, statusSpan);
+    paeDiv.appendChild(navBar);
+
+    const panelRow = document.createElement('div');
+    panelRow.style.cssText = 'display:flex;align-items:center;gap:14px;width:100%;';
+    paeDiv.appendChild(panelRow);
+
+    const grid = document.createElement('div');
+    grid.className = 'pae-grid';
+    grid.style.cssText = 'display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start;flex:1 1 auto;min-width:0;';
+    panelRow.appendChild(grid);
+
+    const barWidth = 100;
+    const rowGap = 14;
+    const availableGridWidth = Math.max(360, (paeDiv.clientWidth || window.innerWidth - 60) - barWidth - rowGap);
+    const colWidth = Math.floor((availableGridWidth - 32) / 3);
+    const size = Math.max(260, colWidth - 12);
+
+    const chainBoundaries = findChainBoundariesForPAE(entries[0][1]);
+
+    slice.forEach(([modelNum, data]) => {
+        const item = document.createElement('div');
+        item.style.cssText = 'display:flex;flex-direction:column;align-items:center;width:100%;';
+
+        const titleEl = document.createElement('div');
+        titleEl.textContent = `Model ${modelNum}`;
+        titleEl.style.cssText = 'font-weight:500;font-size:14px;margin-bottom:4px;text-align:center;';
+
+        const plotEl = document.createElement('div');
+        plotEl.style.cssText = `width:${size}px;height:${size}px;`;
+
+        item.append(titleEl, plotEl);
+        grid.appendChild(item);
+
+        const matrixSize = data.pae.length;
+
         const trace = {
             z: data.pae,
             type: 'heatmap',
@@ -73,99 +224,88 @@ function drawPAEMatrices(modelData) {
                 [0.5, 'rgb(255,255,255)'],
                 [1, 'rgb(255,0,0)']
             ],
+            zauto: false,
             zmin: 0,
             zmax: 30,
-            showscale: i === 0,
+            showscale: false,
             hoverongaps: false
         };
-        
-        // Use 'x'/'y' for the first and 'x2','y2', etc. for others
-        trace.xaxis = i === 0 ? 'x' : 'x' + (i + 1);
-        trace.yaxis = i === 0 ? 'y' : 'y' + (i + 1);
 
-        fig.data.push(trace);
-    });
-    
-    const layoutUpdates = {
-        height: 400 * rows,
-        showlegend: false,
-        margin: { t: 50, b: 50, l: 50, r: 50 },
-        shapes: []
-    };
-
-    // Add chain boundary lines to each subplot
-    for (let i = 0; i < numPlots; i++) {
-        const rowNum = Math.floor(i / cols) + 1;
-        const colNum = (i % cols) + 1;
-        const xref = i === 0 ? 'x' : `x${i + 1}`;
-        const yref = i === 0 ? 'y' : `y${i + 1}`;
-        
-        // Add vertical lines for chain boundaries
-        chainBoundaries.forEach(boundary => {
-            // Vertical line - make it more prominent
-            layoutUpdates.shapes.push({
+        const shapes = chainBoundaries.flatMap((boundary) => [
+            {
                 type: 'line',
                 x0: boundary,
                 x1: boundary,
                 y0: 0,
-                y1: matrixSize, // Use the matrix size from the first model
-                xref: xref,
-                yref: yref,
-                line: {
-                    color: 'rgba(0,0,0,0.8)',
-                    width: 4,
-                    dash: 'solid'
-                }
-            });
-            
-            // Horizontal line - make it more prominent
-            layoutUpdates.shapes.push({
+                y1: matrixSize,
+                line: { color: 'rgba(0,0,0,0.85)', width: 2 }
+            },
+            {
                 type: 'line',
                 x0: 0,
-                x1: matrixSize, // Use the matrix size from the first model
+                x1: matrixSize,
                 y0: boundary,
                 y1: boundary,
-                xref: xref,
-                yref: yref,
-                line: {
-                    color: 'rgba(0,0,0,0.8)',
-                    width: 4,
-                    dash: 'solid'
-                }
-            });
-        });
-    }
+                line: { color: 'rgba(0,0,0,0.85)', width: 2 }
+            }
+        ]);
 
-    const finalLayout = Object.assign({}, fig.layout, layoutUpdates);
-    
-    Plotly.newPlot(paeDiv, fig.data, finalLayout);
+        const layout = {
+            width: size,
+            height: size,
+            margin: { t: 4, b: 28, l: 38, r: 10 },
+            paper_bgcolor: 'rgba(0,0,0,0)',
+            plot_bgcolor: 'rgba(0,0,0,0)',
+            xaxis: {
+                showline: false,
+                showgrid: false,
+                zeroline: false,
+                tickfont: { size: 10 }
+            },
+            yaxis: {
+                showline: false,
+                showgrid: false,
+                zeroline: false,
+                tickfont: { size: 10 }
+            },
+            shapes
+        };
+
+        Plotly.newPlot(plotEl, [trace], layout, { responsive: false, displayModeBar: false });
+    });
+
+    const rowsCount = Math.ceil(slice.length / 3);
+    const itemHeight = size + 26;
+    const panelHeight = rowsCount * itemHeight + (rowsCount - 1) * 16;
+    const barEl = document.createElement('div');
+    barEl.style.cssText = `width:${barWidth}px;height:${panelHeight}px;flex-shrink:0;`;
+    panelRow.appendChild(barEl);
+    drawPanelColorbar(barEl, slice[0][1].pae, panelHeight);
+}
+
+function drawPAEMatrices(modelData) {
+    paeState.entries = Array.from(modelData.entries()).sort(([a], [b]) => comparePaeKeys(a, b));
+    paeState.page = 0;
+    renderPAEPage();
 }
 
 // Helper function to find chain boundaries in PAE data
 function findChainBoundariesForPAE(data) {
-    // Find where chain IDs change
     const chainChanges = [];
     let currentChain = data.chainIds[0];
-    let residueCount = 0;
     let atomsPerResidue = 0;
-    
-    // First count atoms per residue by examining the pattern
-    // Typical amino acids have ~10 atoms (backbone + side chain)
+
     let atomsFound = 0;
     for (let i = 0; i < Math.min(100, data.chainIds.length); i++) {
         atomsFound++;
         if (i > 5 && i % atomsFound === 0) {
-            // Found a pattern - use this as estimated atoms per residue
             atomsPerResidue = atomsFound;
             break;
         }
     }
-    
-    // If we couldn't detect atoms per residue, use default of 10
+
     if (atomsPerResidue === 0 || atomsPerResidue > 15) atomsPerResidue = 10;
-    console.log(`Detected approximately ${atomsPerResidue} atoms per residue`);
-    
-    // Now detect chain changes and convert to residue positions
+
     for (let i = 0; i < data.chainIds.length; i++) {
         if (data.chainIds[i] !== currentChain) {
             const residuePosition = Math.floor(i / atomsPerResidue);
@@ -173,102 +313,88 @@ function findChainBoundariesForPAE(data) {
             currentChain = data.chainIds[i];
         }
     }
-    
-    // Scale to match PAE matrix size
+
     const estimatedTotalResidues = Math.ceil(data.chainIds.length / atomsPerResidue);
     const paeMatrixSize = data.pae.length;
     const scaleFactor = paeMatrixSize / estimatedTotalResidues;
-    
-    return chainChanges.map(pos => Math.round(pos * scaleFactor));
+
+    return chainChanges.map((pos) => Math.round(pos * scaleFactor));
 }
 
 // New function to process pLDDT data for proteins/nucleic acids vs other molecules
 function processPLDDTData(modelData) {
     const processedData = new Map();
-    
+
     for (const [modelNum, data] of modelData.entries()) {
-        // Initialize the processed data for this model
         const processed = {
-            residueIndices: [],  // For plotting
-            residuePLDDTs: [],   // Averaged pLDDTs per residue
-            atomIndices: [],     // For non-protein/non-nucleic atoms
-            atomPLDDTs: []       // Raw pLDDTs for non-protein/non-nucleic atoms
+            residueIndices: [],
+            residuePLDDTs: [],
+            atomIndices: [],
+            atomPLDDTs: []
         };
-        
-        // Group pLDDT by residue
-        const residueGroups = new Map(); // Map<residueId, Array<plddt>>
+
+        const residueGroups = new Map();
         const otherAtoms = {
             indices: [],
             plddts: []
         };
-        
-        // Process each atom's pLDDT
+
         for (let i = 0; i < data.plddts.length; i++) {
             const chainId = data.chainIds[i];
             const plddt = data.plddts[i];
-            
-            // Check if this is part of a protein/nucleic acid
+
             if (isProteinOrNucleicAcid(chainId)) {
-                // Extract residue number from atom name or position
                 const residueId = extractResidueId(i, chainId);
-                
                 if (!residueGroups.has(residueId)) {
                     residueGroups.set(residueId, []);
                 }
                 residueGroups.get(residueId).push(plddt);
             } else {
-                // Keep atom-level pLDDT for other molecules
                 otherAtoms.indices.push(i);
                 otherAtoms.plddts.push(plddt);
             }
         }
-        
-        // Calculate average pLDDT per residue
+
         let currentResidueIndex = 0;
-        for (const [residueId, plddts] of residueGroups.entries()) {
+        for (const [, plddts] of residueGroups.entries()) {
             const avgPLDDT = plddts.reduce((sum, val) => sum + val, 0) / plddts.length;
             processed.residueIndices.push(currentResidueIndex++);
             processed.residuePLDDTs.push(avgPLDDT);
         }
-        
-        // Add atom-level pLDDTs for other molecules
+
         processed.atomIndices = otherAtoms.indices;
         processed.atomPLDDTs = otherAtoms.plddts;
-        
         processedData.set(modelNum, processed);
     }
-    
+
     return processedData;
 }
 
-// Helper function to determine if an atom belongs to protein or nucleic acid
-// You'll need to adjust this based on the actual format of chainIds
 function isProteinOrNucleicAcid(chainId) {
-    // This is a placeholder - you'll need to implement based on your data
-    // For example, check for standard amino acid or nucleotide codes
-    return true; // Default to true for now
+    return true;
 }
 
-// Helper function to extract residue ID from atom data
-// You'll need to adjust this based on your CIF file structure
 function extractResidueId(atomIndex, chainId) {
-    // This is a placeholder - you'll need to implement based on your data
-    // For example, extract from atom name like "CA 123" to get residue number 123
-    return Math.floor(atomIndex / 10); // Just a placeholder calculation
+    return Math.floor(atomIndex / 10);
 }
 
 // Enhanced pLDDT plotting function with chain boundaries
 function drawPLDDTPlot(modelData) {
     console.log('Drawing pLDDT plot with data:', modelData);
-    
+
     try {
+        const plotEl = document.getElementById('pLDDTPlot');
+        if (!plotEl) return;
+
+        // Sort models consistently
+        const sortedEntries = Array.from(modelData.entries()).sort(([a], [b]) => comparePaeKeys(a, b));
+        const sortedModelData = new Map(sortedEntries);
+
         // Group pLDDT values by residue for each model
-        const residueData = processResidueData(modelData);
-        
+        const residueData = processResidueData(sortedModelData);
+
         // Create traces for plotting
         const traces = [];
-        
-        // Add a trace for each model
         for (const [modelNum, data] of residueData.entries()) {
             traces.push({
                 x: data.residueIndices,
@@ -283,14 +409,14 @@ function drawPLDDTPlot(modelData) {
                 }
             });
         }
-        
+
         // Find chain boundaries for the first model
         const firstModelData = residueData.get(Array.from(residueData.keys())[0]);
         const chainBoundaries = findChainBoundariesForPLDDT(firstModelData);
         console.log('Chain boundaries for pLDDT:', chainBoundaries);
-        
+
         // Create vertical line shapes for chain boundaries
-        const shapes = chainBoundaries.map(position => ({
+        const shapes = chainBoundaries.map((position) => ({
             type: 'line',
             x0: position,
             x1: position,
@@ -301,155 +427,146 @@ function drawPLDDTPlot(modelData) {
                 width: 2
             }
         }));
-        
-        // Plot the data
-        Plotly.newPlot('pLDDTPlot', traces, {
-            title: 'pLDDT Scores by Residue',
-            yaxis: {
-                title: 'pLDDT',
-                range: [0, 100]
+
+        // Estimate legend height dynamically while letting Plotly control width
+        const containerWidth = plotEl.clientWidth || plotEl.parentElement?.clientWidth || window.innerWidth - 80;
+        const maxLabelChars = traces.reduce((max, t) => Math.max(max, (t.name || '').length), 10);
+        const estimatedItemWidth = Math.max(150, maxLabelChars * 7.8 + 42);
+        const colsPerRow = Math.max(1, Math.floor((containerWidth - 60) / estimatedItemWidth));
+        const legendRows = Math.max(1, Math.ceil(traces.length / colsPerRow));
+
+        const plotHeight = 315;
+        const xAxisBlockPx = 54; // ticks + "Residue Number" title
+        const legendGapPx = 8;
+        const legendHeight = legendRows * 18 + 12;
+        const bottomMargin = xAxisBlockPx + legendGapPx + legendHeight;
+        const totalHeight = plotHeight + bottomMargin;
+        const legendY = -((xAxisBlockPx + legendGapPx) / plotHeight);
+
+        Plotly.newPlot(
+            plotEl,
+            traces,
+            {
+                title: {
+                    text: 'pLDDT Scores by Residue',
+                    font: { size: 15 }
+                },
+                height: totalHeight,
+                margin: { t: 42, b: bottomMargin, l: 55, r: 25 },
+                yaxis: {
+                    title: { text: 'pLDDT', standoff: 6 },
+                    range: [0, 100]
+                },
+                xaxis: {
+                    title: { text: 'Residue Number', standoff: 6 }
+                },
+                legend: {
+                    orientation: 'h',
+                    x: 0.5,
+                    xanchor: 'center',
+                    y: legendY,
+                    yanchor: 'top',
+                    font: { size: 11 }
+                },
+                shapes: shapes
             },
-            xaxis: {
-                title: 'Residue Number'
-            },
-            legend: {
-                orientation: 'h',
-                y: -0.2
-            },
-            shapes: shapes
-        });
+            { responsive: true }
+        );
     } catch (error) {
         console.error('Error processing pLDDT data:', error);
     }
 }
 
-// Process the raw data to get per-residue pLDDT averages
 function processResidueData(modelData) {
     const residueData = new Map();
-    
+
     for (const [modelNum, data] of modelData.entries()) {
-        // Initialize data for this model
         const processedData = {
-            residueIndices: [], 
+            residueIndices: [],
             residuePLDDTs: [],
             residueLabels: []
         };
-        
-        // Extract residue information and group pLDDTs by residue
-        const residueGroups = new Map(); // Map<chainId_residueNum, {sum, count}>
-        
-        // Step 1: Find the pattern of residue boundaries
+
+        const residueGroups = new Map();
         const residueBoundaries = findResidueBoundaries(data.chainIds);
-        console.log(`Model ${modelNum}: Found ${residueBoundaries.length} residue boundaries`);
-        
-        // Step 2: Process each atom's pLDDT and assign to residue
+
         let currentResidueNum = 1;
         let currentChain = data.chainIds[0];
-        let residueStartIdx = 0;
-        
+
         for (let i = 0; i < data.plddts.length; i++) {
             const chainId = data.chainIds[i];
             const plddt = data.plddts[i];
-            
-            // Check if we've crossed a residue boundary
+
             if (i > 0 && residueBoundaries.includes(i)) {
                 currentResidueNum++;
-                
-                // If chain changed, reset residue numbering
                 if (chainId !== currentChain) {
                     currentResidueNum = 1;
                     currentChain = chainId;
                 }
-                
-                residueStartIdx = i;
             }
-            
-            // Create a unique key for each residue (chain + residue number)
+
             const residueKey = `${chainId}_${currentResidueNum}`;
-            
             if (!residueGroups.has(residueKey)) {
-                residueGroups.set(residueKey, { 
-                    sum: 0, 
-                    count: 0, 
-                    chain: chainId, 
-                    resNum: currentResidueNum 
+                residueGroups.set(residueKey, {
+                    sum: 0,
+                    count: 0,
+                    chain: chainId,
+                    resNum: currentResidueNum
                 });
             }
-            
-            // Add this atom's pLDDT to the residue's total
-            const residueData = residueGroups.get(residueKey);
-            residueData.sum += plddt;
-            residueData.count += 1;
+
+            const entry = residueGroups.get(residueKey);
+            entry.sum += plddt;
+            entry.count += 1;
         }
-        
-        // Convert residue groups to arrays for plotting
-        // Sort by chain then by residue number
-        const sortedResidues = Array.from(residueGroups.values())
-            .sort((a, b) => {
-                if (a.chain !== b.chain) return a.chain.localeCompare(b.chain);
-                return a.resNum - b.resNum;
-            });
-        
-        // Calculate average pLDDT per residue
+
+        const sortedResidues = Array.from(residueGroups.values()).sort((a, b) => {
+            if (a.chain !== b.chain) return a.chain.localeCompare(b.chain);
+            return a.resNum - b.resNum;
+        });
+
         for (let i = 0; i < sortedResidues.length; i++) {
             const residue = sortedResidues[i];
             const avgPLDDT = residue.sum / residue.count;
-            
-            processedData.residueIndices.push(i + 1); // 1-based index for residues
+
+            processedData.residueIndices.push(i + 1);
             processedData.residuePLDDTs.push(avgPLDDT);
             processedData.residueLabels.push(`Chain ${residue.chain}, Residue ${residue.resNum}`);
         }
-        
+
         residueData.set(modelNum, processedData);
     }
-    
+
     return residueData;
 }
 
-// Function to identify residue boundaries based on atom patterns
 function findResidueBoundaries(chainIds) {
     const boundaries = [];
-    
-    // In CIF files, atoms within a residue follow a fairly standard pattern
-    // This is a simplified approach that looks for repeating patterns of atom names
-    // by detecting where one residue ends and another begins
-    
-    // For typical amino acids, the pattern is: N, CA, C, O, and then side chain atoms
-    // When we see a new "N" atom after other atoms, it's likely a new residue
-    
     let currentChain = chainIds[0];
-    
+
     for (let i = 1; i < chainIds.length; i++) {
-        // If chain changes, it's definitely a new residue
         if (chainIds[i] !== currentChain) {
             boundaries.push(i);
             currentChain = chainIds[i];
             continue;
         }
-        
-        // Special rule for chain transitions
-        if (i < chainIds.length - 1 && chainIds[i] !== chainIds[i+1]) {
-            boundaries.push(i+1);
+
+        if (i < chainIds.length - 1 && chainIds[i] !== chainIds[i + 1]) {
+            boundaries.push(i + 1);
         }
-        
-        // For the same chain, we check the atom pattern
-        // In AlphaFold CIF files, each residue has around 7-14 atoms depending on the amino acid
-        // For simplicity, we'll use a heuristic based on examining several AF structures
-        if (i % 8 === 0) { // Approximate residue boundary - this will be refined later
+
+        if (i % 8 === 0) {
             boundaries.push(i);
         }
     }
-    
-    // Remove duplicates and sort
+
     return Array.from(new Set(boundaries)).sort((a, b) => a - b);
 }
 
-// Helper function to find chain boundaries in pLDDT data
 function findChainBoundariesForPLDDT(data) {
     const boundaries = [];
     let currentChain = null;
-    
-    // Detect chain changes from residue labels
+
     data.residueLabels.forEach((label, index) => {
         const chain = label.split(',')[0].split(' ')[1];
         if (chain !== currentChain) {
@@ -457,11 +574,10 @@ function findChainBoundariesForPLDDT(data) {
             currentChain = chain;
         }
     });
-    
+
     return boundaries;
 }
 
-// Helper functions
 function findChainBoundaries(chainIds) {
     const boundaries = [];
     let currentChain = chainIds[0];
